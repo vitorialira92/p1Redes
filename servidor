@@ -1,29 +1,162 @@
 #!/usr/bin/env python3
 import asyncio
-from tcp import Servidor
+from grader.tcp import Servidor, Conexao
+
 import re
 
+nicknamesOnline = {} 
+channels = {}
 
-def validar_nome(nome):
-    return re.match(br'^[a-zA-Z][a-zA-Z0-9_-]*$', nome) is not None
-
-
-def sair(conexao):
-    print(conexao, 'conexão fechada')
-    conexao.fechar()
+setattr(Conexao, 'nickname', b'*') 
+setattr(Conexao, 'joined_channels', []) 
 
 
-def dados_recebidos(conexao, dados):
-    if dados == b'':
-        return sair(conexao)
-    print(conexao, dados)
+def join_channel(conn, channel): #REVISADO
+    channel = channel.strip().lower()
+    if not channel.startswith(b'#') or not is_name_valid(channel[1:]):
+        conn.enviar(b':server 403 ' + channel + b' :No such channel')
+        return
+    if channel not in channels:
+        channels[channel] = []
+
+    channels[channel].append(conn)
+    conn.joined_channels.append(channel)
+    
+    for member in channels[channel]:
+        member.enviar(b':' + conn.nickname + b' JOIN :' + channel + b'\r\n')
+    
+    message_max_length = 512
+    message_beginning = b':server 353 ' + conn.nickname + b' = ' + channel + b' :'
+    message_ending = b'\r\n'
+    message = message_beginning
+
+    members = sorted([members.nickname for members in channels[channel]])
+    
+    for member in members:
+        if len(message + member + b' ' + message_ending) > message_max_length:
+            conn.enviar(message.rstrip() + message_ending)
+
+            message = message_beginning + member + b' '
+        else:
+            message = message + member + b' '
+
+    conn.enviar(message.rstrip() + message_ending)
+    conn.enviar(b':server 366 ' + conn.nickname + b' ' + channel + b' :End of /NAMES list.\r\n')
 
 
-def conexao_aceita(conexao):
-    print(conexao, 'nova conexão')
-    conexao.registrar_recebedor(dados_recebidos)
+def leave_channel(conn, channel): #REVISADO
+    if channel in conn.joined_channels:
+        for member in channels[channel]:
+            member.enviar(b':' + conn.nickname + b' PART ' + channel + b'\r\n')
+        channels[channel].remove(conn)
+        conn.joined_channels.remove(channel)
 
+
+def handle_command(conn, command):#OK
+    command_name, *parameters = command.split(b' ', 2)
+
+    match command_name:
+        case b'PING':
+            conn.enviar(b':server PONG server :' + b' '.join(parameters))
+        case b'NICK':
+            set_nickname(conn, parameters[0].strip())
+        case b'PRIVMSG':
+            send_message(conn, *parameters)
+        case b'JOIN':
+            join_channel(conn, parameters[0])
+        case b'PART':
+            leave_channel(conn, parameters[0].strip())
+        
+
+def handle_received_data(conn, data):
+    if data == b'':
+        return leave_connection(conn)
+    get_data(conn, data.decode("utf-8"))
+    print(conn, data)
+
+
+def get_data(conn, data):#OK
+    if not hasattr(conn, 'commands'):
+        conn.commands = ''
+
+    conn.commands += data
+
+    while '\n' in conn.commands:
+        complete_command, conn.commands = conn.commands.split('\n', 1)
+        complete_command += '\n'
+        handle_command(conn, complete_command.encode("utf-8"))
+
+
+def accept_connection(conn):
+    print(conn, 'nova conexão')
+    conn.registrar_recebedor(handle_received_data)
+
+
+def leave_connection(conn):
+    print(conn, 'conexão fechada')
+    sender = conn.nickname
+    users_notified = []
+    
+    for channel in conn.joined_channels:
+        if conn in channels[channel]:
+            channels[channel].remove(conn)
+
+        for member in channels[channel]:
+            if member not in users_notified:
+                member.enviar(b':' + sender + b' QUIT :Connection closed\r\n')
+                users_notified.append(member) 
+
+    nicknamesOnline.pop(conn.nickname)
+    conn.fechar()
+
+
+def is_name_valid(nickname):
+    return re.match(br'^[a-zA-Z][a-zA-Z0-9_-]*$', nickname) is not None
+
+
+def set_nickname(conn, nickname): #REVISADO
+    if nickname.endswith(b'\r'):
+        nickname = nickname[:-1]
+
+    nickname_lower = nickname.lower()
+
+    currentNickname = conn.nickname.lower()
+
+    if not is_name_valid(nickname_lower):
+        conn.enviar(b':server 432 * ' + nickname + b' :Erroneous nickname\r\n')
+        return
+
+    if nickname_lower in nicknamesOnline:
+        conn.enviar(b':server 433 ' + currentNickname + b' ' + nickname + b' :Nickname is already in use\r\n')
+        return
+    
+    if currentNickname != b'*':
+        conn.nickname = nickname_lower
+        nicknamesOnline.pop(currentNickname, None)
+        nicknamesOnline[nickname_lower] = conn
+        conn.enviar(b':' + currentNickname + b' NICK ' + nickname + b'\r\n')
+        return
+    
+    conn.nickname = nickname_lower
+    nicknamesOnline[nickname_lower] = conn
+    conn.enviar(b':server 001 ' + nickname + b' :Welcome\r\n')
+    conn.enviar(b':server 422 ' + nickname + b' :MOTD File is missing\r\n')
+
+
+def send_message(conn, recipient, content): #REVISADO
+    sender = conn.nickname
+    recipient = recipient.lower()
+    message = b':' + sender + b' PRIVMSG ' + recipient + b' ' + content
+
+    if recipient.startswith(b'#'): 
+        if recipient in channels:
+            for participante in channels[recipient]:
+                if participante != conn:
+                    participante.enviar(message)
+    else:
+        if recipient in nicknamesOnline:
+            nicknamesOnline[recipient].enviar(message)
 
 servidor = Servidor(6667)
-servidor.registrar_monitor_de_conexoes_aceitas(conexao_aceita)
+servidor.registrar_monitor_de_conexoes_aceitas(accept_connection)
 asyncio.get_event_loop().run_forever()
